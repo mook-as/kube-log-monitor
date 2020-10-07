@@ -71,7 +71,7 @@ func init() {
 	var namespace []string
 	var pod, container, output string
 	flags := rootCmd.Flags()
-	flags.StringSliceVar(&namespace, "namespaces", []string{"scf"}, "Namespaces to monitor")
+	flags.StringSliceVar(&namespace, "namespaces", []string{"scf", "kubecf", "cf-operator"}, "Namespaces to monitor")
 	flags.StringVar(&pod, "pod", ".*", "Pods to match")
 	flags.StringVar(&container, "container", ".*", "Containers to match")
 	flags.StringVar(&output, "output", wd, "directory to output logs")
