@@ -3,6 +3,7 @@ package kubelogmonitor
 import (
 	"fmt"
 	"io"
+	"io/ioutil"
 	"os"
 	"path"
 	"regexp"
@@ -15,6 +16,7 @@ import (
 	"k8s.io/apimachinery/pkg/watch"
 	"k8s.io/client-go/kubernetes"
 	corev1 "k8s.io/client-go/kubernetes/typed/core/v1"
+	"sigs.k8s.io/yaml"
 )
 
 // logRequests is the map of pod name -> container id -> log stream.
@@ -57,6 +59,7 @@ func statusVerbose(message string, pieces ...interface{}) {
 	}
 	fmt.Printf(strings.Join(formats, "")+"\n", args...)
 }
+
 func statusSilent(message string, pieces ...interface{}) {
 	if len(message) > maxStatusMessage {
 		panic(fmt.Sprintf("Invalid message: %q", message))
@@ -92,8 +95,8 @@ func Monitor(client *kubernetes.Clientset, outputDir string, namespaces []string
 						errors <- podEvent.err
 						return
 					}
-					if !podMatcher.MatchString(podEvent.podName) {
-						statusFunc("Skipping pod", namespace, podEvent.podName)
+					if !podMatcher.MatchString(podEvent.pod.Name) {
+						statusFunc("Skipping pod", namespace, podEvent.pod.Name)
 						continue
 					}
 					for i := 0; i < 3; i++ {
@@ -171,7 +174,7 @@ func (c *containerInfo) String() string {
 
 type podInfoOrError struct {
 	err        error
-	podName    string
+	pod        *apicorev1.Pod
 	containers []containerInfo
 }
 
@@ -195,7 +198,7 @@ func podInfoFromPod(pod *apicorev1.Pod) podInfoOrError {
 		})
 	}
 	return podInfoOrError{
-		podName:    pod.Name,
+		pod:        pod.DeepCopy(),
 		containers: containerStates,
 	}
 }
@@ -263,20 +266,37 @@ func monitorPods(client *kubernetes.Clientset, namespace string, closer <-chan s
 }
 
 func watchPod(outputDir, namespace string, pods corev1.PodInterface, podInfo podInfoOrError, containerMatcher *regexp.Regexp) error {
+	if podInfo.err != nil {
+		panic("watchPod should never get an error for podInfo")
+	}
 	logRequestLock.Lock()
-	if _, ok := logRequests[podInfo.podName]; !ok {
-		logRequests[podInfo.podName] = make(map[string]io.ReadCloser)
+	if _, ok := logRequests[podInfo.pod.Name]; !ok {
+		logRequests[podInfo.pod.Name] = make(map[string]io.ReadCloser)
 	}
 	logRequestLock.Unlock()
 
 	err := func() error {
 		if outputDir != "" {
-			outputDir = path.Join(outputDir, namespace, podInfo.podName)
+			outputDir = path.Join(outputDir, namespace, podInfo.pod.Name)
 			err := os.MkdirAll(outputDir, os.ModeDir|0755)
 			if err != nil {
 				return err
 			}
 		}
+
+		func() {
+			outPath := path.Join(outputDir, "resource.yaml")
+			buf, err := yaml.Marshal(podInfo.pod)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Could not marshal resource %s/%s\n", namespace, podInfo.pod.Name)
+				return
+			}
+			err = ioutil.WriteFile(outPath, buf, 0644)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Could not write resource %s/%s\n", namespace, podInfo.pod.Name)
+				return
+			}
+		}()
 
 		var errorLock sync.Mutex
 		var errors []error
@@ -333,14 +353,14 @@ func watchPod(outputDir, namespace string, pods corev1.PodInterface, podInfo pod
 			go func(container containerInfo) {
 				defer wg.Done()
 				if !containerMatcher.MatchString(container.name) {
-					statusFunc("Skipping container", namespace, podInfo.podName, container.name)
+					statusFunc("Skipping container", namespace, podInfo.pod.Name, container.name)
 					return
 				}
 				switch container.state {
 				case containerStateRunning:
 					// Ensure the container is being watched
 					logRequestLock.Lock()
-					reader := logRequests[podInfo.podName][container.id]
+					reader := logRequests[podInfo.pod.Name][container.id]
 					logRequestLock.Unlock()
 					if reader != nil {
 						// Container is running, _and_ we have an existing reader.
@@ -349,7 +369,7 @@ func watchPod(outputDir, namespace string, pods corev1.PodInterface, podInfo pod
 					}
 					// Container is running, but there's no existing reader.
 					// The container just started (or we had logs from a previous run).
-					err := copyLogs(pods, podInfo.podName, container, "Starting to watch")
+					err := copyLogs(pods, podInfo.pod.Name, container, "Starting to watch")
 					if err != nil {
 						errorLock.Lock()
 						errors = append(errors, err)
@@ -360,15 +380,15 @@ func watchPod(outputDir, namespace string, pods corev1.PodInterface, podInfo pod
 					// The container is terminated; check if we already have status
 					// for it.
 					logRequestLock.Lock()
-					reader, ok := logRequests[podInfo.podName][container.id]
+					reader, ok := logRequests[podInfo.pod.Name][container.id]
 					logRequestLock.Unlock()
 					if reader != nil {
 						// We have an active reader; drop it (but leave it running
 						// in case we can get more logs).
 						logRequestLock.Lock()
-						logRequests[podInfo.podName][container.id] = nil
+						logRequests[podInfo.pod.Name][container.id] = nil
 						logRequestLock.Unlock()
-						statusFunc("Stopped watching", namespace, podInfo.podName, container.name)
+						statusFunc("Stopped watching", namespace, podInfo.pod.Name, container.name)
 						return
 					}
 					if ok {
@@ -379,7 +399,7 @@ func watchPod(outputDir, namespace string, pods corev1.PodInterface, podInfo pod
 					// We don't have an existing reader; dump the container
 					// logs post-mortem.  The container managed to exit before
 					// we noticed it.
-					err := copyLogs(pods, podInfo.podName, container, "Post-mortem read")
+					err := copyLogs(pods, podInfo.pod.Name, container, "Post-mortem read")
 					if err != nil {
 						errorLock.Lock()
 						errors = append(errors, err)
@@ -391,18 +411,18 @@ func watchPod(outputDir, namespace string, pods corev1.PodInterface, podInfo pod
 					// existing information, it's about a previous container.
 					// Remove the container.
 					logRequestLock.Lock()
-					reader, ok := logRequests[podInfo.podName][container.id]
+					reader, ok := logRequests[podInfo.pod.Name][container.id]
 					logRequestLock.Unlock()
 					if ok {
 						logRequestLock.Lock()
-						delete(logRequests[podInfo.podName], container.id)
+						delete(logRequests[podInfo.pod.Name], container.id)
 						logRequestLock.Unlock()
 						if reader != nil {
 							reader.Close()
 						}
-						statusFunc("Stopped watching", namespace, podInfo.podName, container.name)
+						statusFunc("Stopped watching", namespace, podInfo.pod.Name, container.name)
 					} else {
-						statusFunc("Ignoring unknown", namespace, podInfo.podName, container.name)
+						statusFunc("Ignoring unknown", namespace, podInfo.pod.Name, container.name)
 					}
 				}
 			}(container)
@@ -414,7 +434,7 @@ func watchPod(outputDir, namespace string, pods corev1.PodInterface, podInfo pod
 		return nil
 	}()
 	if err != nil {
-		return fmt.Errorf("failed to watch pod %s: %w", podInfo.podName, err)
+		return fmt.Errorf("failed to watch pod %s: %w", podInfo.pod.Name, err)
 	}
 	return nil
 }
